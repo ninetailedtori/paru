@@ -523,35 +523,34 @@ impl Installer {
         base: &mut Base,
         repo: Option<(&str, &str)>,
         dir: &Path,
-        cwd: &Path,
     ) -> Result<(HashMap<String, String>, String)> {
         let pkgdest = repo.map(|r| r.1);
 
-        // Apply per-package overrides
-        let pkg_override = get_base_override(config, base);
+        let pkg_override = get_base_override(config, base)?;
         let saved_makepkg_conf = config.makepkg_conf.clone();
         let saved_chroot_makepkg_conf = self.chroot.makepkg_conf.clone();
-        let saved_env = config.env.clone();
 
-        if let Some(ref ov) = pkg_override {
-            apply_patches(config, cwd, &ov.pkgbuild_patches).await?;
-
-            if let Some(ref conf) = ov.makepkg_conf {
-                config.makepkg_conf = Some(conf.clone());
-                if config.chroot {
-                    self.chroot.makepkg_conf = conf.clone();
-                }
+        // Held until the end of this function, so the file is deleted on every return path
+        let override_conf = match pkg_override {
+            Some(ref ov) => {
+                apply_patches(config, dir, &ov.pkgbuild_patches).await?;
+                Some(exec::write_override_conf(ov, dir)?)
             }
-            // Keep overrides local to child commands; Tokio may already have threads running.
-            config.env.extend(ov.env.iter().cloned());
+            None => None,
+        };
+
+        if let Some(ref f) = override_conf {
+            let path = f.path().to_string_lossy().into_owned();
+            config.makepkg_conf = Some(path.clone());
+            if config.chroot {
+                self.chroot.makepkg_conf = path;
+            }
         }
 
         let result = self.build_pkgbuild_inner(config, base, repo, dir, pkgdest);
 
-        // Restore original config
         config.makepkg_conf = saved_makepkg_conf;
         self.chroot.makepkg_conf = saved_chroot_makepkg_conf;
-        config.env = saved_env;
 
         result
     }
@@ -753,7 +752,6 @@ impl Installer {
         config: &mut Config,
         base: &mut Base,
         repo: Option<(&str, &str)>,
-        cwd: &Path,
     ) -> Result<()> {
         let dir = match base {
             Base::Aur(_) => config.build_dir.join(base.package_base()),
@@ -831,7 +829,7 @@ impl Installer {
         }
 
         let (mut pkgdest, version) = if build {
-            self.build_pkgbuild(config, base, repo, &dir, cwd).await?
+            self.build_pkgbuild(config, base, repo, &dir).await?
         } else {
             printtr!("{}: parsing pkg list...", base);
             let (pkgdests, version) = parse_package_list(config, &dir, pkgdest)?;
@@ -887,7 +885,6 @@ impl Installer {
         &mut self,
         config: &mut Config,
         build: &mut [Base],
-        cwd: &Path,
     ) -> Result<()> {
         if config.devel {
             printtr!("fetching devel info...");
@@ -920,7 +917,7 @@ impl Installer {
                 .as_ref()
                 .map(|(name, file)| (name.as_str(), file.as_str()));
 
-            let err = self.build_install_pkgbuild(config, base, repo_server, cwd);
+            let err = self.build_install_pkgbuild(config, base, repo_server);
 
             match err.await {
                 Ok(_) => {
@@ -987,8 +984,7 @@ impl Installer {
             config.pkgbuild_repos.refresh(config)?;
             self.done_something = true;
         }
-        let cwd = std::env::current_dir()?;
-        self.resolve_targets(config, &repo_targets, &aur_targets, &cwd)
+        self.resolve_targets(config, &repo_targets, &aur_targets)
             .await
     }
 
@@ -997,7 +993,6 @@ impl Installer {
         config: &mut Config,
         repo_targets: &[Targ<'a>],
         aur_targets: &[Targ<'a>],
-        cwd: &Path,
     ) -> Result<()> {
         if (config.mode.aur() || config.mode.pkgbuild())
             && (self.sysupgrade != 0 || !aur_targets.is_empty())
@@ -1093,7 +1088,7 @@ impl Installer {
         let mut err = Ok(());
 
         if !build.is_empty() {
-            err = self.build_install_pkgbuilds(config, &mut build, cwd).await;
+            err = self.build_install_pkgbuilds(config, &mut build).await;
         }
 
         if err.is_ok() && config.chroot {
@@ -1324,19 +1319,22 @@ async fn apply_patches(config: &Config, dir: &Path, patches: &[PatchSource]) -> 
     Ok(())
 }
 
-fn get_base_override(config: &Config, base: &Base) -> Option<PackageOverride> {
-    let mut result: Option<PackageOverride> = None;
+fn get_base_override(config: &Config, base: &Base) -> Result<Option<PackageOverride>> {
+    let mut found: Option<&PackageOverride> = None;
 
     for pkg_name in base.packages() {
         if let Some(ov) = config.overrides.get(pkg_name) {
-            match result {
-                None => result = Some(ov.clone()),
-                Some(ref mut merged) => merged.merge_from(ov),
+            match found {
+                None => found = Some(ov),
+                Some(prev) if prev == ov => {}
+                Some(_) => {
+                    bail!("packages in the same base have conflicting overrides (at '{pkg_name}')")
+                }
             }
         }
     }
 
-    result
+    Ok(found.cloned())
 }
 
 fn is_debug(pkg: &alpm::Package) -> bool {

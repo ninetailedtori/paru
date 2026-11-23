@@ -4,10 +4,10 @@ use crate::exec::{self, Status};
 use crate::fmt::color_repo;
 use crate::info::get_terminal_width;
 use crate::pkgbuild::PkgbuildRepos;
-use crate::util::{get_provider, reopen_stdin, split_by_comma};
+use crate::util::{get_provider, reopen_stdin, split_list_items};
 use crate::{alpm_debug_enabled, help, printtr, repo};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env::consts::ARCH;
 use std::env::var;
 use std::fmt;
@@ -398,7 +398,7 @@ impl ConfigEnum for YesNoAllTree {
     ];
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PatchSource {
     Path(PathBuf),
     Url(Url),
@@ -458,30 +458,35 @@ impl FromStr for PatchSource {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PackageOverride {
     pub makepkg_conf: Option<String>,
-    pub env: Vec<(String, String)>,
+    pub env: BTreeMap<String, String>,
     pub pkgbuild_patches: Vec<PatchSource>,
 }
 
 impl PackageOverride {
-    pub(crate) fn merge_from(&mut self, src: &PackageOverride) {
-        if src.makepkg_conf.is_some() {
-            self.makepkg_conf = src.makepkg_conf.clone();
+    fn apply_group(&mut self, group: &GroupOverride) {
+        if group.makepkg_conf.is_some() {
+            self.makepkg_conf = group.makepkg_conf.clone();
         }
-
-        for (k, v) in &src.env {
-            if let Some(existing) = self.env.iter_mut().find(|(ek, _)| ek == k) {
-                existing.1 = v.clone();
-            } else {
-                self.env.push((k.clone(), v.clone()));
-            }
-        }
-
-        self.pkgbuild_patches
-            .extend(src.pkgbuild_patches.iter().cloned());
+        self.env.extend(group.env.clone());
     }
+
+    fn apply_package(&mut self, pkg: &PackageOverride) {
+        if pkg.makepkg_conf.is_some() {
+            self.makepkg_conf = pkg.makepkg_conf.clone();
+        }
+        self.env.extend(pkg.env.clone());
+        self.pkgbuild_patches
+            .extend(pkg.pkgbuild_patches.iter().cloned());
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupOverride {
+    pub makepkg_conf: Option<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -489,14 +494,14 @@ enum OverrideParseState {
     Package {
         name: String,
         makepkg_conf: Option<String>,
-        env: Vec<(String, String)>,
+        env: BTreeMap<String, String>,
         pkgbuild_patches: Vec<PatchSource>,
     },
     Group {
         name: String,
         packages: Vec<String>,
         makepkg_conf: Option<String>,
-        env: Vec<(String, String)>,
+        env: BTreeMap<String, String>,
     },
 }
 
@@ -650,9 +655,11 @@ pub struct Config {
     pub delete: u32,
     pub no_install: bool,
 
+    // TODO: basically, env has to be loaded in our tmpfile too, so it works properly!
     pub env: Vec<(String, String)>,
 
     pub overrides: HashMap<String, PackageOverride>,
+    group_overrides: Vec<(Vec<String>, GroupOverride)>,
     override_parse_state: Option<OverrideParseState>,
 
     //pacman
@@ -686,7 +693,7 @@ impl Ini for Config {
                 if !matches!(section, "options" | "bin" | "env")
                     && self.pkgbuild_repos.repo(section).is_none()
                 {
-                    if matches!(section, "local" | "aur" | "pkg" | "base") {
+                    if matches!(section, "local" | "aur" | "pkg" | "base" | "override") {
                         bail!(tr!("section can not be called {}", section));
                     }
                     if let Some(rest) = section.strip_prefix("override.package.") {
@@ -697,7 +704,7 @@ impl Ini for Config {
                         self.override_parse_state = Some(OverrideParseState::Package {
                             name: rest.to_string(),
                             makepkg_conf: None,
-                            env: Vec::new(),
+                            env: BTreeMap::new(),
                             pkgbuild_patches: Vec::new(),
                         });
                     } else if let Some(rest) = section.strip_prefix("override.group.") {
@@ -709,7 +716,7 @@ impl Ini for Config {
                             name: rest.to_string(),
                             packages: Vec::new(),
                             makepkg_conf: None,
-                            env: Vec::new(),
+                            env: BTreeMap::new(),
                         });
                     } else if section.contains('.') {
                         bail!(tr!("section can not be called {}", section));
@@ -832,6 +839,7 @@ impl Config {
 
     pub fn parse_args<S: AsRef<str>, I: IntoIterator<Item = S>>(&mut self, iter: I) -> Result<()> {
         self.finalize_override()?;
+        self.compile_overrides();
 
         let iter = iter.into_iter();
         let mut iter = iter.peekable();
@@ -1426,6 +1434,10 @@ then initialise it with:
                         name
                     )
                 );
+                ensure!(
+                    !self.overrides.contains_key(&name),
+                    tr!("duplicate override.package.{} section", name)
+                );
                 self.overrides.insert(
                     name,
                     PackageOverride {
@@ -1449,23 +1461,33 @@ then initialise it with:
                     makepkg_conf.is_some() || !env.is_empty(),
                     tr!("override.group.{} must have MakepkgConf or Overrides", name)
                 );
-                for pkg in packages {
-                    let entry = self.overrides.entry(pkg).or_default();
-                    if let Some(ref conf) = makepkg_conf {
-                        entry.makepkg_conf = Some(conf.clone());
-                    }
-                    for (k, v) in &env {
-                        if let Some(existing) = entry.env.iter_mut().find(|(ek, _)| ek == k) {
-                            existing.1 = v.clone();
-                        } else {
-                            entry.env.push((k.clone(), v.clone()));
-                        }
-                    }
-                }
+                ensure!(
+                    !self.overrides.contains_key(&name),
+                    tr!("duplicate override.group.{} section", name)
+                );
+                self.group_overrides
+                    .push((packages, GroupOverride { makepkg_conf, env }));
             }
         }
 
         Ok(())
+    }
+
+    pub fn compile_overrides(&mut self) {
+        let mut flat: HashMap<String, PackageOverride> = HashMap::new();
+
+        for (packages, group) in &self.group_overrides {
+            for pkg in packages {
+                flat.entry(pkg.clone()).or_default().apply_group(group);
+            }
+        }
+
+        for (name, ov) in std::mem::take(&mut self.overrides) {
+            flat.entry(name).or_default().apply_package(&ov);
+        }
+
+        self.overrides = flat;
+        self.group_overrides.clear();
     }
 
     pub fn aur_namespace(&self) -> &'static str {
@@ -1478,7 +1500,7 @@ then initialise it with:
     }
 }
 
-fn parse_overrides_map(input: &str) -> Result<Vec<(String, String)>> {
+fn parse_overrides_map(input: &str) -> Result<BTreeMap<String, String>> {
     let input = input.trim();
     let inner = input
         .strip_prefix('{')
@@ -1487,11 +1509,11 @@ fn parse_overrides_map(input: &str) -> Result<Vec<(String, String)>> {
         .trim();
 
     if inner.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
 
-    let mut result = Vec::new();
-    let pairs = split_by_comma(inner);
+    let mut result = BTreeMap::new();
+    let pairs = split_list_items(inner);
 
     for pair in &pairs {
         let pair = pair.trim();
@@ -1502,24 +1524,28 @@ fn parse_overrides_map(input: &str) -> Result<Vec<(String, String)>> {
             .split_once('=')
             .context(tr!("invalid override entry, expected KEY = value"))?;
         let key = key.trim().to_string();
-        let value = value.trim();
         let value = value
+            .trim()
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(value)
+            .unwrap_or(value.trim())
             .to_string();
 
-        ensure!(!key.is_empty(), tr!("override key can not be empty"));
         ensure!(
-            !key.contains('\0'),
-            tr!("override key can not contain null bytes")
+            key.chars()
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()),
+            tr!("override key '{}' is not a valid shell variable name", key)
         );
         ensure!(
-            !value.contains('\0'),
-            tr!("override value can not contain null bytes")
+            !value.contains(['\0', '\n', '\r']),
+            tr!("override value can not contain control characters")
         );
 
-        result.push((key, value));
+        if result.insert(key.clone(), value).is_some() {
+            bail!(tr!("duplicate override key '{}'", key));
+        }
     }
 
     Ok(result)
@@ -1537,14 +1563,14 @@ fn parse_patches_list(input: &str) -> Result<Vec<PatchSource>> {
         return Ok(Vec::new());
     }
 
-    let parts = split_by_comma(inner);
+    let parts = split_list_items(inner);
 
     let mut result = Vec::new();
     for part in parts {
         let value = part
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .unwrap_or(part.as_str())
+            .unwrap_or(part)
             .to_string();
 
         ensure!(!value.is_empty(), tr!("Patch source can not be empty"));
@@ -1705,6 +1731,7 @@ mod sort_tests {
 mod tests {
     use super::{Config, parse_overrides_map, parse_release_age};
     use globset::{Glob, GlobSetBuilder};
+    use std::collections::BTreeMap;
 
     #[test]
     fn release_age_units() {
@@ -1769,7 +1796,7 @@ mod tests {
         let result = parse_overrides_map(r#"{ LDFLAGS = "-Wl,--as-needed" }"#).unwrap();
         assert_eq!(
             result,
-            vec![("LDFLAGS".to_string(), "-Wl,--as-needed".to_string())]
+            BTreeMap::from([("LDFLAGS".to_string(), "-Wl,--as-needed".to_string())])
         );
     }
 
@@ -1779,10 +1806,10 @@ mod tests {
             parse_overrides_map(r#"{ LDFLAGS = "-Wl,--as-needed", CFLAGS = "-O2" }"#).unwrap();
         assert_eq!(
             result,
-            vec![
+            BTreeMap::from([
                 ("LDFLAGS".to_string(), "-Wl,--as-needed".to_string()),
                 ("CFLAGS".to_string(), "-O2".to_string()),
-            ]
+            ])
         );
     }
 
@@ -1791,10 +1818,10 @@ mod tests {
         let result = parse_overrides_map(r#"{ CFLAGS = "-O3", MAKEFLAGS = "-j8" }"#).unwrap();
         assert_eq!(
             result,
-            vec![
+            BTreeMap::from([
                 ("CFLAGS".to_string(), "-O3".to_string()),
                 ("MAKEFLAGS".to_string(), "-j8".to_string()),
-            ]
+            ])
         );
     }
 

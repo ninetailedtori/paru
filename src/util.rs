@@ -452,26 +452,26 @@ pub fn is_arch_repo(name: &str) -> bool {
     )
 }
 
-pub fn split_by_comma(inner: &str) -> Vec<String> {
+pub fn split_list_items(input: &str) -> Vec<&str> {
     let mut items = Vec::new();
-    let mut current = String::new();
+    let mut start = 0;
+    let mut depth: usize = 0;
     let mut in_quotes = false;
 
-    for ch in inner.chars() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            current.push(ch);
-        } else if ch == ',' && !in_quotes {
-            items.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
+    for (i, c) in input.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '(' if !in_quotes => depth += 1,
+            ')' if !in_quotes => depth = depth.saturating_sub(1),
+            ',' if !in_quotes && depth == 0 => {
+                items.push(input[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
         }
     }
 
-    if !current.is_empty() {
-        items.push(current);
-    }
-
+    items.push(input[start..].trim());
     items
 }
 

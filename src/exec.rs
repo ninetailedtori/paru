@@ -2,15 +2,19 @@
 
 use crate::args::Args;
 use crate::config::Config;
+use crate::config::PackageOverride;
 
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 
 use anyhow::{Context, Result, bail};
 use log::debug;
@@ -18,6 +22,11 @@ use signal_hook::consts::signal::*;
 use signal_hook::flag as signal_flag;
 use std::sync::LazyLock;
 use tr::tr;
+
+const DEFAULT_CHAIN: &str = r#"for f in /etc/makepkg.conf /etc/makepkg.conf.d/*.conf "$HOME/.makepkg.conf"; do
+    [ -f "$f" ] && . "$f"
+done
+"#;
 
 pub static DEFAULT_SIGNALS: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| {
     let arc = Arc::new(AtomicBool::new(true));
@@ -205,6 +214,32 @@ pub fn pacman_output<S: AsRef<str> + Display + std::fmt::Debug>(
     let mut cmd = new_pacman(config, args);
     cmd.stdin(Stdio::inherit());
     command_output(&mut cmd)
+}
+
+pub fn write_override_conf(ov: &PackageOverride, dir: &Path) -> Result<NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix(".paru-override-")
+        .suffix(".conf")
+        .tempfile_in(dir)?;
+
+    let mut contents = String::new();
+
+    match &ov.makepkg_conf {
+        Some(conf) => contents.push_str(&format!("source \"{conf}\"\n")),
+        None => contents.push_str(DEFAULT_CHAIN),
+    }
+
+    for (key, value) in &ov.env {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        contents.push_str(&format!("{key}=\"{escaped}\"\n"));
+    }
+
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+
+    std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644))?;
+
+    Ok(file)
 }
 
 fn new_makepkg<S: AsRef<OsStr>>(
